@@ -31,6 +31,7 @@
     input[type="text"]::placeholder { color: var(--muted); }
     .load-btn { background: var(--accent); color: #0a0a0a; border: none; border-radius: 10px; padding: 12px 20px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.85rem; cursor: pointer; transition: transform 0.15s, background 0.2s; white-space: nowrap; }
     .load-btn:hover { background: #d4ff6a; transform: scale(1.03); }
+    .load-btn:disabled { opacity: 0.7; cursor: wait; transform: none; }
     .error-msg { font-family: 'Space Mono', monospace; font-size: 0.65rem; color: #ff6b6b; min-height: 1em; }
     .player-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; display: none; flex-direction: column; }
     .player-card.visible { display: flex; animation: fadeUp 0.4s ease forwards; }
@@ -62,15 +63,15 @@
     input[type="range"] { -webkit-appearance: none; flex: 1; height: 3px; background: var(--surface2); border-radius: 3px; outline: none; cursor: pointer; }
     input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); cursor: pointer; }
     .status { font-family: 'Space Mono', monospace; font-size: 0.65rem; color: var(--muted); text-align: center; padding: 0 20px 16px; min-height: 1.4em; }
-    .playlist-list { border-top: 1px solid var(--border); max-height: 200px; overflow-y: auto; display: none; }
+    .playlist-list { border-top: 1px solid var(--border); max-height: 240px; overflow-y: auto; display: none; }
     .playlist-list.visible { display: block; }
     .playlist-list::-webkit-scrollbar { width: 4px; }
     .playlist-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-    .pl-item { display: flex; align-items: center; gap: 12px; padding: 10px 20px; cursor: pointer; transition: background 0.15s; border-bottom: 1px solid var(--border); }
+    .pl-item { display: flex; align-items: center; gap: 12px; padding: 10px 20px; cursor: pointer; transition: background 0.15s; border-bottom: 1px solid var(--border); min-height: 40px; }
     .pl-item:last-child { border-bottom: none; }
     .pl-item:hover { background: var(--surface2); }
     .pl-item.active { background: rgba(200,245,90,0.06); }
-    .pl-num { font-family: 'Space Mono', monospace; font-size: 0.6rem; color: var(--muted); width: 20px; flex-shrink: 0; }
+    .pl-num { font-family: 'Space Mono', monospace; font-size: 0.6rem; color: var(--muted); width: 26px; flex-shrink: 0; }
     .pl-item.active .pl-num { color: var(--accent); }
     .pl-title { font-size: 0.78rem; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .pl-item.active .pl-title { color: var(--accent); }
@@ -86,7 +87,7 @@
     <div class="input-label">Paste a YouTube video or playlist URL</div>
     <div class="input-row">
       <input type="text" id="url-input" placeholder="https://youtube.com/watch?v=..." />
-      <button class="load-btn" onclick="loadURL()">Load</button>
+      <button class="load-btn" id="load-btn" onclick="loadURL()">Load</button>
     </div>
     <div class="error-msg" id="error-msg"></div>
   </div>
@@ -125,19 +126,33 @@
   </div>
 </div>
 
-<div style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;">
+<div style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;overflow:hidden;">
   <div id="yt-player"></div>
 </div>
 
 <script>
-  // ── State ─────────────────────────────────────────────
-  var player = null, playerReady = false;
-  var isPlaying = false, loopOn = true, isPlaylist = false;
-  var videoIds = [], currentIndex = 0;
-  var scrubTimer = null, isScrubbing = false;
+  var player = null;
+  var playerReady = false;
+  var isPlaylist = false;
+  var loopOn = true;
+  var currentIndex = 0;
+  var videoIds = [];
+  var titleCache = {};
+  var scrubTimer = null;
+  var isScrubbing = false;
+  var loadToken = 0;
+  var titleQueue = [];
+  var activeTitleFetches = 0;
+  var extractingPlaylist = false;
+  var PLAYLIST_POLL_ID = null;
+  var VISIBLE_RADIUS = 30;
+  var TITLE_FETCH_CONCURRENCY = 3;
 
-  // ── Bootstrap YT API ─────────────────────────────────
-  (function() {
+  var playlistListEl = document.getElementById('playlist-list');
+  var loadBtnEl = document.getElementById('load-btn');
+  var scrubTrack = document.getElementById('scrub-track');
+
+  (function bootstrapYT() {
     var s = document.createElement('script');
     s.src = 'https://www.youtube.com/iframe_api';
     document.head.appendChild(s);
@@ -145,226 +160,438 @@
 
   function onYouTubeIframeAPIReady() {
     player = new YT.Player('yt-player', {
-      width: '1', height: '1',
-      playerVars: { autoplay: 0, controls: 0, playsinline: 1 },
+      width: '1',
+      height: '1',
+      playerVars: {
+        autoplay: 0,
+        controls: 0,
+        playsinline: 1,
+        rel: 0,
+        modestbranding: 1
+      },
       events: {
-        onReady: function(e) { playerReady = true; e.target.setVolume(80); },
+        onReady: function(e) {
+          playerReady = true;
+          e.target.setVolume(80);
+          setStatus('Ready.');
+        },
         onStateChange: onStateChange,
         onError: onPlayerError
       }
     });
   }
 
-  // ── Player events ─────────────────────────────────────
   function onStateChange(e) {
+    if (!window.YT) return;
     var S = YT.PlayerState;
+
+    if (extractingPlaylist) return;
+
     if (e.data === S.PLAYING) {
       setPlaying(true);
-      try { var d = player.getVideoData(); if (d && d.title) setTitle(d.title); } catch(x) {}
       startScrubUpdater();
+      updateTrackTitleFromPlayer();
     } else if (e.data === S.PAUSED) {
-      setPlaying(false);
+      setPlaying(false, '⏸ Paused');
       stopScrubUpdater();
     } else if (e.data === S.ENDED) {
       stopScrubUpdater();
       onVideoEnded();
+    } else if (e.data === S.BUFFERING) {
+      setStatus('Buffering...');
     }
   }
 
   function onPlayerError(e) {
-    // Any error: just skip to next track. Video plays fine solo but this
-    // handles any remaining embed restrictions gracefully.
-    console.warn('Player error code:', e.data, 'on video', videoIds[currentIndex]);
+    console.warn('YT error', e.data, 'index', currentIndex, 'video', videoIds[currentIndex]);
+
+    if (extractingPlaylist) {
+      cleanupPlaylistExtraction();
+      showError('Could not read that playlist.');
+      setLoading(false);
+      return;
+    }
+
     if (isPlaylist && videoIds.length > 1) {
-      setStatus('Skipping track ' + (currentIndex + 1) + '...');
-      setTimeout(advanceToNext, 600);
+      setStatus('Skipping unavailable track...');
+      window.setTimeout(function() {
+        advanceToNext();
+      }, 350);
     } else {
-      showError('Cannot play this video — it may be restricted.');
-      setPlaying(false);
+      showError('Cannot play this video — it may be restricted or unavailable.');
+      setPlaying(false, 'Playback unavailable.');
     }
   }
 
   function onVideoEnded() {
     if (isPlaylist) {
       advanceToNext();
+      return;
+    }
+    if (loopOn) {
+      try {
+        player.seekTo(0, true);
+        player.playVideo();
+      } catch (err) {}
     } else {
-      if (loopOn) { player.seekTo(0); player.playVideo(); }
-      else { setPlaying(false); setStatus('Ended.'); }
+      setPlaying(false, 'Ended.');
     }
   }
 
-  // ── Playlist navigation (fully self-managed) ──────────
-  // We NEVER use player.loadPlaylist() or player.playVideoAt().
-  // Every video is loaded individually via loadVideoById().
-  // This bypasses ALL playlist embed restrictions.
+  function parseURL(raw) {
+    try {
+      var u = new URL(raw);
+      var host = u.hostname.replace(/^www\./, '');
+      var videoId = null;
+      var listId = u.searchParams.get('list');
 
-  function playIndex(idx) {
-    if (idx < 0 || idx >= videoIds.length) return;
-    currentIndex = idx;
-    var vid = videoIds[idx];
-    player.loadVideoById(vid);
-    highlightItem(idx);
-    setStatus('Track ' + (idx + 1) + ' / ' + videoIds.length);
-    // Update title immediately from cache, then fetch if needed
-    var cached = document.getElementById('plt' + idx);
-    if (cached && cached.textContent && cached.textContent !== 'Track ' + (idx+1)) {
-      setTitle(cached.textContent);
-    } else {
-      setTitle('Loading...');
-      fetchTitle(vid, function(t) {
-        setTitle(t);
-        if (cached) cached.textContent = t;
-      });
+      if (host === 'youtu.be') {
+        videoId = u.pathname.replace(/^\//, '').split('/')[0];
+      } else if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'music.youtube.com') {
+        if (u.pathname === '/watch') {
+          videoId = u.searchParams.get('v');
+        } else if (u.pathname.indexOf('/shorts/') === 0) {
+          videoId = u.pathname.split('/shorts/')[1].split('/')[0];
+        } else if (u.pathname === '/playlist') {
+          videoId = null;
+        } else if (u.pathname.indexOf('/embed/') === 0) {
+          videoId = u.pathname.split('/embed/')[1].split('/')[0];
+        }
+      }
+
+      return { videoId: videoId, listId: listId };
+    } catch (err) {
+      return null;
     }
-    // Reset scrub
+  }
+
+  function clearAsyncWork() {
+    stopScrubUpdater();
+    clearPlaylistExtractionPoll();
+    titleQueue = [];
+    activeTitleFetches = 0;
+    extractingPlaylist = false;
+  }
+
+  function resetUIForLoad() {
+    clearError();
     setScrub(0, 0);
+    setTitle('—');
+    playlistListEl.innerHTML = '';
+    playlistListEl.classList.remove('visible');
+    document.getElementById('player-card').classList.add('visible');
+  }
+
+  function setLoading(isLoading) {
+    loadBtnEl.disabled = isLoading;
+    loadBtnEl.textContent = isLoading ? 'Loading...' : 'Load';
+  }
+
+  function loadURL() {
+    if (!playerReady || !player) {
+      showError('Player initializing — try again in a second.');
+      return;
+    }
+
+    var raw = document.getElementById('url-input').value.trim();
+    if (!raw) {
+      showError('Paste a YouTube URL first.');
+      return;
+    }
+
+    var parsed = parseURL(raw);
+    if (!parsed || (!parsed.videoId && !parsed.listId)) {
+      showError("That doesn't look like a valid YouTube URL.");
+      return;
+    }
+
+    loadToken += 1;
+    clearAsyncWork();
+    resetUIForLoad();
+    setLoading(true);
+
+    videoIds = [];
+    currentIndex = 0;
+    isPlaylist = false;
+
+    if (parsed.listId) {
+      isPlaylist = true;
+      document.getElementById('track-type').textContent = 'PLAYLIST';
+      setStatus('Reading playlist...');
+      extractPlaylistIDs(parsed.listId, parsed.videoId, loadToken);
+    } else {
+      document.getElementById('track-type').textContent = 'VIDEO';
+      videoIds = [parsed.videoId];
+      playIndex(0, loadToken);
+      setLoading(false);
+    }
+  }
+
+  function extractPlaylistIDs(listId, startVideoId, token) {
+    extractingPlaylist = true;
+
+    try {
+      player.cuePlaylist({ listType: 'playlist', list: listId, index: 0 });
+    } catch (err) {
+      extractingPlaylist = false;
+      setLoading(false);
+      showError('Could not open that playlist.');
+      return;
+    }
+
+    var tries = 0;
+    PLAYLIST_POLL_ID = window.setInterval(function() {
+      tries += 1;
+
+      if (token !== loadToken) {
+        cleanupPlaylistExtraction();
+        return;
+      }
+
+      var ids = null;
+      try {
+        ids = player.getPlaylist();
+      } catch (err) {}
+
+      if (Array.isArray(ids) && ids.length) {
+        cleanupPlaylistExtraction();
+        videoIds = ids.slice();
+        currentIndex = Math.max(0, startVideoId ? ids.indexOf(startVideoId) : 0);
+        if (currentIndex === -1) currentIndex = 0;
+        renderPlaylistWindow();
+        playlistListEl.classList.add('visible');
+        setStatus('Loaded ' + ids.length + ' tracks');
+        playIndex(currentIndex, token);
+        setLoading(false);
+      } else if (tries > 60) {
+        cleanupPlaylistExtraction();
+        setLoading(false);
+        showError('Could not load playlist — it may be private, blocked, or too slow to read.');
+      }
+    }, 250);
+  }
+
+  function cleanupPlaylistExtraction() {
+    extractingPlaylist = false;
+    clearPlaylistExtractionPoll();
+    try { player.stopVideo(); } catch (err) {}
+  }
+
+  function clearPlaylistExtractionPoll() {
+    if (PLAYLIST_POLL_ID) {
+      window.clearInterval(PLAYLIST_POLL_ID);
+      PLAYLIST_POLL_ID = null;
+    }
+  }
+
+  function playIndex(idx, token) {
+    if (!playerReady || !player) return;
+    if (idx < 0 || idx >= videoIds.length) return;
+    if (token && token !== loadToken) return;
+
+    currentIndex = idx;
+    renderPlaylistWindow();
+    updateVisibleTitles();
+    setTitle(getCachedTitle(idx) || 'Loading...');
+    setStatus(isPlaylist ? 'Track ' + (idx + 1) + ' / ' + videoIds.length : 'Loading...');
+    setScrub(0, 0);
+
+    try {
+      player.loadVideoById(videoIds[idx]);
+    } catch (err) {
+      showError('Could not load that track.');
+    }
+
+    fetchTitleForIndex(idx, true);
+    if (isPlaylist) {
+      fetchTitleForIndex(idx - 1, false);
+      fetchTitleForIndex(idx + 1, false);
+    }
   }
 
   function advanceToNext() {
+    if (!videoIds.length) return;
     if (currentIndex < videoIds.length - 1) {
-      playIndex(currentIndex + 1);
+      playIndex(currentIndex + 1, loadToken);
     } else if (loopOn) {
-      playIndex(0);
+      playIndex(0, loadToken);
     } else {
-      setPlaying(false);
-      setStatus('Playlist ended.');
+      setPlaying(false, 'Playlist ended.');
     }
   }
 
   function prevTrack() {
-    if (!playerReady) return;
-    if (isPlaylist && videoIds.length) {
-      playIndex((currentIndex - 1 + videoIds.length) % videoIds.length);
+    if (!playerReady || !videoIds.length) return;
+    if (isPlaylist) {
+      playIndex((currentIndex - 1 + videoIds.length) % videoIds.length, loadToken);
     } else {
-      try { player.seekTo(0); } catch(e) {}
+      try { player.seekTo(0, true); } catch (err) {}
     }
   }
 
   function nextTrack() {
-    if (!playerReady) return;
-    if (isPlaylist && videoIds.length) {
-      playIndex((currentIndex + 1) % videoIds.length);
+    if (!playerReady || !videoIds.length) return;
+    if (isPlaylist) {
+      playIndex((currentIndex + 1) % videoIds.length, loadToken);
     } else {
-      try { player.seekTo(0); player.playVideo(); } catch(e) {}
+      try {
+        player.seekTo(0, true);
+        player.playVideo();
+      } catch (err) {}
     }
   }
 
-  // ── URL parsing & loading ─────────────────────────────
-  function parseURL(raw) {
-    try {
-      var u = new URL(raw);
-      var list = u.searchParams.get('list');
-      var v = u.searchParams.get('v') || (u.hostname === 'youtu.be' ? u.pathname.slice(1).split('?')[0] : null);
-      return { videoId: v, listId: list };
-    } catch(e) { return null; }
+  function getWindowBounds() {
+    if (!isPlaylist) return { start: 0, end: 0 };
+    var start = Math.max(0, currentIndex - VISIBLE_RADIUS);
+    var end = Math.min(videoIds.length, currentIndex + VISIBLE_RADIUS + 1);
+    return { start: start, end: end };
   }
 
-  function loadURL() {
-    if (!playerReady) { showError('Player initializing — try again in a second.'); return; }
-    var raw = document.getElementById('url-input').value.trim();
-    clearError();
-    if (!raw) { showError('Paste a YouTube URL first.'); return; }
-    var p = parseURL(raw);
-    if (!p || (!p.videoId && !p.listId)) { showError("Doesn't look like a valid YouTube URL."); return; }
-
-    // Reset UI
-    videoIds = []; currentIndex = 0; isPlaylist = false;
-    stopScrubUpdater(); setScrub(0, 0);
-    document.getElementById('playlist-list').innerHTML = '';
-    document.getElementById('playlist-list').classList.remove('visible');
-    document.getElementById('player-card').classList.add('visible');
-    setTitle('—'); setStatus('Loading...');
-
-    if (p.listId) {
-      isPlaylist = true;
-      document.getElementById('track-type').textContent = 'PLAYLIST';
-      fetchPlaylistIDs(p.listId, p.videoId);
-    } else {
-      document.getElementById('track-type').textContent = 'VIDEO';
-      videoIds = [p.videoId];
-      player.loadVideoById(p.videoId);
-      fetchTitle(p.videoId, setTitle);
+  function renderPlaylistWindow() {
+    if (!isPlaylist || !videoIds.length) {
+      playlistListEl.innerHTML = '';
+      playlistListEl.classList.remove('visible');
+      return;
     }
-  }
 
-  // Fetch playlist video IDs by briefly loading it into the player,
-  // reading getPlaylist(), then immediately switching to self-managed mode.
-  function fetchPlaylistIDs(listId, startVideoId) {
-    setStatus('Fetching playlist...');
+    var bounds = getWindowBounds();
+    var frag = document.createDocumentFragment();
+    var i;
 
-    // Temporarily use loadPlaylist just to read the ID list
-    player.loadPlaylist({ listType: 'playlist', list: listId, index: 0 });
+    playlistListEl.innerHTML = '';
 
-    var tries = 0;
-    var poll = setInterval(function() {
-      tries++;
-      var ids = null;
-      try { ids = player.getPlaylist(); } catch(e) {}
-      if (ids && ids.length > 0) {
-        clearInterval(poll);
-        videoIds = ids;
-        // NOW stop using YT playlist mode — load first video individually
-        var startIdx = 0;
-        if (startVideoId) {
-          var found = ids.indexOf(startVideoId);
-          if (found > -1) startIdx = found;
-        }
-        buildPlaylistUI(ids);
-        setStatus('Loaded ' + ids.length + ' tracks');
-        playIndex(startIdx);
-      } else if (tries > 50) {
-        clearInterval(poll);
-        showError('Could not load playlist — it may be private or empty.');
-      }
-    }, 200);
-  }
-
-  function buildPlaylistUI(ids) {
-    var list = document.getElementById('playlist-list');
-    list.innerHTML = '';
-    ids.forEach(function(vid, i) {
+    for (i = bounds.start; i < bounds.end; i++) {
       var div = document.createElement('div');
-      div.className = 'pl-item' + (i === 0 ? ' active' : '');
-      div.dataset.i = i;
-      div.innerHTML = '<div class="pl-num">' + String(i+1).padStart(2,'0') + '</div>' +
-                      '<div class="pl-title" id="plt' + i + '">Track ' + (i+1) + '</div>';
-      div.onclick = (function(idx) { return function() { playIndex(idx); }; })(i);
-      list.appendChild(div);
-    });
-    list.classList.add('visible');
-    // Staggered title fetching
-    ids.slice(0, 50).forEach(function(vid, i) {
-      setTimeout(function() {
-        fetchTitle(vid, function(t) {
-          var el = document.getElementById('plt' + i);
-          if (el) el.textContent = t;
-          if (i === currentIndex) setTitle(t);
+      div.className = 'pl-item' + (i === currentIndex ? ' active' : '');
+      div.dataset.i = String(i);
+
+      var num = document.createElement('div');
+      num.className = 'pl-num';
+      num.textContent = String(i + 1).padStart(2, '0');
+
+      var title = document.createElement('div');
+      title.className = 'pl-title';
+      title.id = 'plt-' + i;
+      title.textContent = titleCache[videoIds[i]] || ('Track ' + (i + 1));
+
+      div.appendChild(num);
+      div.appendChild(title);
+      div.onclick = (function(idx) {
+        return function() { playIndex(idx, loadToken); };
+      })(i);
+      frag.appendChild(div);
+    }
+
+    playlistListEl.appendChild(frag);
+    playlistListEl.classList.add('visible');
+    ensureActiveVisible();
+  }
+
+  function ensureActiveVisible() {
+    var active = playlistListEl.querySelector('.pl-item.active');
+    if (!active) return;
+
+    var listRect = playlistListEl.getBoundingClientRect();
+    var itemRect = active.getBoundingClientRect();
+    if (itemRect.top < listRect.top || itemRect.bottom > listRect.bottom) {
+      active.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function updateVisibleTitles() {
+    if (!isPlaylist) return;
+    var bounds = getWindowBounds();
+    for (var i = bounds.start; i < bounds.end; i++) {
+      fetchTitleForIndex(i, i === currentIndex);
+    }
+  }
+
+  function fetchTitleForIndex(idx, prioritize) {
+    if (idx < 0 || idx >= videoIds.length) return;
+    var id = videoIds[idx];
+    if (!id || titleCache[id] || isQueued(id)) return;
+
+    if (prioritize) titleQueue.unshift({ id: id, idx: idx, token: loadToken });
+    else titleQueue.push({ id: id, idx: idx, token: loadToken });
+
+    processTitleQueue();
+  }
+
+  function isQueued(id) {
+    for (var i = 0; i < titleQueue.length; i++) {
+      if (titleQueue[i].id === id) return true;
+    }
+    return false;
+  }
+
+  function processTitleQueue() {
+    while (activeTitleFetches < TITLE_FETCH_CONCURRENCY && titleQueue.length) {
+      var job = titleQueue.shift();
+      if (job.token !== loadToken || titleCache[job.id]) continue;
+
+      activeTitleFetches += 1;
+      fetch('https://noembed.com/embed?url=https://www.youtube.com/watch?v=' + encodeURIComponent(job.id))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (job.token !== loadToken) return;
+          if (data && data.title) {
+            titleCache[job.id] = data.title;
+            updateTitleInDOM(job.idx, data.title);
+            if (videoIds[currentIndex] === job.id) setTitle(data.title);
+          }
+        })
+        .catch(function() {})
+        .finally(function() {
+          activeTitleFetches -= 1;
+          processTitleQueue();
         });
-      }, i * 80);
-    });
+    }
   }
 
-  function fetchTitle(id, cb) {
-    fetch('https://noembed.com/embed?url=https://www.youtube.com/watch?v=' + id)
-      .then(function(r) { return r.json(); })
-      .then(function(d) { if (d && d.title) cb(d.title); })
-      .catch(function() {});
+  function updateTitleInDOM(idx, title) {
+    var el = document.getElementById('plt-' + idx);
+    if (el) el.textContent = title;
   }
 
-  // ── Scrub bar ─────────────────────────────────────────
+  function getCachedTitle(idx) {
+    var id = videoIds[idx];
+    return id ? titleCache[id] : '';
+  }
+
+  function updateTrackTitleFromPlayer() {
+    try {
+      var data = player.getVideoData();
+      var id = videoIds[currentIndex];
+      if (data && data.title) {
+        titleCache[id] = data.title;
+        setTitle(data.title);
+        updateTitleInDOM(currentIndex, data.title);
+      }
+    } catch (err) {}
+  }
+
   function startScrubUpdater() {
     stopScrubUpdater();
-    scrubTimer = setInterval(updateScrub, 500);
+    scrubTimer = window.setInterval(updateScrub, 500);
   }
-  function stopScrubUpdater() { clearInterval(scrubTimer); }
+
+  function stopScrubUpdater() {
+    if (scrubTimer) {
+      window.clearInterval(scrubTimer);
+      scrubTimer = null;
+    }
+  }
+
   function updateScrub() {
     if (isScrubbing || !playerReady || !player) return;
     try {
       var cur = player.getCurrentTime() || 0;
       var dur = player.getDuration() || 0;
       setScrub(cur, dur);
-    } catch(e) {}
+    } catch (err) {}
   }
+
   function setScrub(cur, dur) {
     var pct = dur > 0 ? (cur / dur) * 100 : 0;
     document.getElementById('scrub-fill').style.width = pct + '%';
@@ -372,30 +599,37 @@
     document.getElementById('time-current').textContent = fmtTime(cur);
     document.getElementById('time-duration').textContent = fmtTime(dur);
   }
+
   function fmtTime(s) {
-    s = Math.floor(s);
-    var m = Math.floor(s / 60), sec = s % 60;
+    s = Math.max(0, Math.floor(s || 0));
+    var m = Math.floor(s / 60);
+    var sec = s % 60;
     return m + ':' + (sec < 10 ? '0' : '') + sec;
   }
 
-  var scrubTrack = document.getElementById('scrub-track');
   scrubTrack.addEventListener('mousedown', startScrub);
   scrubTrack.addEventListener('touchstart', startScrub, { passive: true });
+
   function startScrub(e) {
-    isScrubbing = true; doScrub(e);
+    isScrubbing = true;
+    doScrub(e);
     document.addEventListener('mousemove', doScrub);
     document.addEventListener('touchmove', doScrub, { passive: true });
     document.addEventListener('mouseup', endScrub);
     document.addEventListener('touchend', endScrub);
   }
+
   function doScrub(e) {
     var rect = scrubTrack.getBoundingClientRect();
     var clientX = e.touches ? e.touches[0].clientX : e.clientX;
     var pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     document.getElementById('scrub-fill').style.width = (pct * 100) + '%';
     document.getElementById('scrub-thumb').style.left = (pct * 100) + '%';
-    try { document.getElementById('time-current').textContent = fmtTime(pct * (player.getDuration() || 0)); } catch(x) {}
+    try {
+      document.getElementById('time-current').textContent = fmtTime(pct * (player.getDuration() || 0));
+    } catch (err) {}
   }
+
   function endScrub(e) {
     isScrubbing = false;
     document.removeEventListener('mousemove', doScrub);
@@ -407,46 +641,55 @@
       var clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
       var pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
       player.seekTo(pct * (player.getDuration() || 0), true);
-    } catch(x) {}
+    } catch (err) {}
   }
 
-  // ── Controls ──────────────────────────────────────────
   function togglePlay() {
     if (!playerReady || !player) return;
     try {
       if (player.getPlayerState() === YT.PlayerState.PLAYING) player.pauseVideo();
       else player.playVideo();
-    } catch(e) {}
+    } catch (err) {}
   }
+
   function toggleLoop() {
     loopOn = !loopOn;
     document.getElementById('loop-badge').classList.toggle('on', loopOn);
     setStatus('Loop ' + (loopOn ? 'ON' : 'OFF'));
   }
+
   function setVolume(v) {
-    if (playerReady && player) try { player.setVolume(parseInt(v)); } catch(e) {}
+    if (!playerReady || !player) return;
+    try { player.setVolume(parseInt(v, 10)); } catch (err) {}
   }
 
-  // ── UI helpers ────────────────────────────────────────
-  function setPlaying(val) {
-    isPlaying = val;
+  function setPlaying(val, customStatus) {
     document.getElementById('play-btn').innerHTML = val ? '&#9646;&#9646;' : '&#9654;';
     document.getElementById('visualizer').classList.toggle('playing', val);
-    if (val) setStatus(isPlaylist ? 'Track ' + (currentIndex + 1) + ' / ' + videoIds.length : '▶ Playing');
-    else setStatus('⏸ Paused');
+    if (customStatus) {
+      setStatus(customStatus);
+    } else if (val) {
+      setStatus(isPlaylist ? 'Track ' + (currentIndex + 1) + ' / ' + videoIds.length : '▶ Playing');
+    } else {
+      setStatus('⏸ Paused');
+    }
   }
-  function highlightItem(idx) {
-    document.querySelectorAll('.pl-item').forEach(function(el) {
-      el.classList.toggle('active', parseInt(el.dataset.i) === idx);
-    });
-    // Auto-scroll active item into view
-    var active = document.querySelector('.pl-item.active');
-    if (active) active.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+  function setTitle(text) {
+    document.getElementById('track-title').textContent = text || '—';
   }
-  function setTitle(t) { document.getElementById('track-title').textContent = t || '—'; }
-  function setStatus(m) { document.getElementById('status-msg').textContent = m; }
-  function showError(m) { document.getElementById('error-msg').textContent = m; }
-  function clearError() { document.getElementById('error-msg').textContent = ''; }
+
+  function setStatus(text) {
+    document.getElementById('status-msg').textContent = text || '';
+  }
+
+  function showError(text) {
+    document.getElementById('error-msg').textContent = text || '';
+  }
+
+  function clearError() {
+    document.getElementById('error-msg').textContent = '';
+  }
 
   document.getElementById('url-input').addEventListener('keydown', function(e) {
     if (e.key === 'Enter') loadURL();
